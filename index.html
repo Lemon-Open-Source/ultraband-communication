@@ -2,25 +2,31 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Ultrasonic Web Communication (Louder)</title>
+  <title>Audible & Ultrasonic Web Text Transfer</title>
   <style>
     body { font-family: sans-serif; padding: 20px; }
+    textarea, select { width: 100%; margin-top: 10px; }
     button { margin: 5px; padding: 10px; }
     #log { white-space: pre-wrap; background: #eee; padding: 10px; height: 150px; overflow-y: scroll; }
   </style>
 </head>
 <body>
 
-<h1>Ultrasonic Web Communication (Louder Version)</h1>
+<h1>Text Over Sound (Audible or Ultrasonic)</h1>
 
-<textarea id="message" rows="2" cols="40" placeholder="Type bits like 1010101"></textarea><br/>
-<button id="sendBtn">Send</button>
+<label>Mode:</label>
+<select id="mode">
+  <option value="audible">Audible (Clearer)</option>
+  <option value="ultrasonic">Ultrasonic (Silent)</option>
+</select>
+
+<textarea id="textInput" rows="3" placeholder="Type your message..."></textarea><br/>
+<button id="sendBtn">Send Text</button>
 <button id="startListenBtn">Start Listening</button>
 <button id="stopListenBtn" disabled>Stop Listening</button>
 
-<h3>Received bits:</h3>
-<div id="received"></div>
+<h3>Received Message:</h3>
+<div id="receivedText" style="white-space:pre-wrap;font-weight:bold;"></div>
 
 <h3>Log:</h3>
 <div id="log"></div>
@@ -36,63 +42,73 @@
   const AudioContext = window.AudioContext || window.webkitAudioContext;
   const audioCtx = new AudioContext();
 
-  // Frequencies adjusted for better speaker/mic compatibility
-  const FREQ_0 = 14000;
-  const FREQ_1 = 15500;
-  const BIT_DURATION = 0.2; // seconds per bit
+  const MODES = {
+    audible: { freq0: 1000, freq1: 2000 },
+    ultrasonic: { freq0: 14000, freq1: 15500 }
+  };
 
-  // Loud square wave tone generator
-  function playTone(freq, duration) {
+  const BIT_DURATION = 0.2;
+  const CHAR_DELIM = '11111111'; // End of character marker
+
+  function textToBits(text) {
+    return [...new TextEncoder().encode(text)].map(byte =>
+      byte.toString(2).padStart(8, '0')
+    ).join('');
+  }
+
+  function bitsToText(bits) {
+    let bytes = [];
+    for (let i = 0; i < bits.length; i += 8) {
+      const byte = bits.slice(i, i + 8);
+      if (byte.length === 8) bytes.push(parseInt(byte, 2));
+    }
+    return new TextDecoder().decode(new Uint8Array(bytes));
+  }
+
+  async function playTone(freq, duration) {
     return new Promise(resolve => {
-      const oscillator = audioCtx.createOscillator();
-      oscillator.frequency.value = freq;
-      oscillator.type = 'square'; // louder than sine
-
-      const gainNode = audioCtx.createGain();
-      gainNode.gain.setValueAtTime(1.0, audioCtx.currentTime); // maximum gain
-
-      oscillator.connect(gainNode);
-      gainNode.connect(audioCtx.destination);
-
-      oscillator.start();
-      oscillator.stop(audioCtx.currentTime + duration);
-
-      oscillator.onended = resolve;
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = 'square';
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(1.0, audioCtx.currentTime);
+      osc.connect(gain).connect(audioCtx.destination);
+      osc.start();
+      osc.stop(audioCtx.currentTime + duration);
+      osc.onended = resolve;
     });
   }
 
-  // Send a string of bits
-  async function sendBits(bits) {
-    log("Sending bits: " + bits);
-    for (let bit of bits) {
-      const freq = bit === '1' ? FREQ_1 : FREQ_0;
+  async function sendText(text, mode) {
+    const { freq0, freq1 } = MODES[mode];
+    const bits = textToBits(text);
+    log(`Sending: "${text}"\nBits: ${bits}`);
+    for (const bit of bits) {
+      const freq = bit === '1' ? freq1 : freq0;
       await playTone(freq, BIT_DURATION);
-      await new Promise(r => setTimeout(r, 50)); // gap between bits
+      await new Promise(r => setTimeout(r, 40));
     }
-    log("Send complete");
+    log("Send complete.");
   }
 
   document.getElementById('sendBtn').onclick = async () => {
-    let bits = document.getElementById('message').value.trim();
-    if (!bits.match(/^[01]+$/)) {
-      alert("Please enter only bits (0 and 1).");
-      return;
-    }
+    const text = document.getElementById('textInput').value;
+    const mode = document.getElementById('mode').value;
+    if (!text) return alert("Enter text to send.");
     if (audioCtx.state === 'suspended') await audioCtx.resume();
-    sendBits(bits);
+    await sendText(text, mode);
   };
 
-  // --- Receiver setup ---
-  let micStream;
-  let analyser;
-  let dataArray;
-  let animationId;
-  let receivedBits = '';
-  const receivedElem = document.getElementById('received');
+  // --- Listening ---
+  let micStream, analyser, dataArray, animationId;
+  let receivedBits = '', lastBitTime = 0;
+  const receivedText = document.getElementById('receivedText');
 
   async function startListening() {
+    const mode = document.getElementById('mode').value;
+    const { freq0, freq1 } = MODES[mode];
     if (audioCtx.state === 'suspended') await audioCtx.resume();
-    micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
     const source = audioCtx.createMediaStreamSource(micStream);
     analyser = audioCtx.createAnalyser();
     analyser.fftSize = 2048;
@@ -100,58 +116,47 @@
     dataArray = new Uint8Array(analyser.frequencyBinCount);
 
     receivedBits = '';
-    receivedElem.textContent = '';
-    log("Listening started");
+    receivedText.textContent = '';
+    lastBitTime = 0;
+    log("Listening...");
 
-    let lastBitTime = 0;
-    const bitInterval = (BIT_DURATION + 0.05) * 1000;
+    const getBin = f => Math.round(f / (audioCtx.sampleRate / analyser.fftSize));
+    const bin0 = getBin(freq0), bin1 = getBin(freq1);
+    const threshold = 100, interval = (BIT_DURATION + 0.05) * 1000;
 
-    function getFrequencyBin(freq) {
-      return Math.round(freq / (audioCtx.sampleRate / analyser.fftSize));
-    }
-
-    function detectBit() {
+    function listenLoop() {
       analyser.getByteFrequencyData(dataArray);
-      const bin0 = getFrequencyBin(FREQ_0);
-      const bin1 = getFrequencyBin(FREQ_1);
-
       const mag0 = dataArray[bin0];
       const mag1 = dataArray[bin1];
+      let bit = null;
 
-      const threshold = 100;
-
-      let detectedBit = null;
-      if (mag0 > threshold && mag0 > mag1) detectedBit = '0';
-      else if (mag1 > threshold && mag1 > mag0) detectedBit = '1';
-
-      if (detectedBit !== null) {
-        const now = performance.now();
-        if (now - lastBitTime > bitInterval - 50) {
-          receivedBits += detectedBit;
-          receivedElem.textContent = receivedBits;
-          log(`Detected bit: ${detectedBit}`);
-          lastBitTime = now;
-        }
+      if (mag0 > threshold || mag1 > threshold) {
+        if (mag1 > mag0) bit = '1';
+        else bit = '0';
       }
-      animationId = requestAnimationFrame(detectBit);
+
+      const now = performance.now();
+      if (bit !== null && now - lastBitTime > interval - 50) {
+        receivedBits += bit;
+        try {
+          const text = bitsToText(receivedBits);
+          receivedText.textContent = text;
+        } catch {}
+        lastBitTime = now;
+      }
+
+      animationId = requestAnimationFrame(listenLoop);
     }
 
-    detectBit();
-
+    listenLoop();
     document.getElementById('startListenBtn').disabled = true;
     document.getElementById('stopListenBtn').disabled = false;
   }
 
   function stopListening() {
-    if (micStream) {
-      micStream.getTracks().forEach(track => track.stop());
-      micStream = null;
-    }
-    if (animationId) {
-      cancelAnimationFrame(animationId);
-      animationId = null;
-    }
-    log("Listening stopped");
+    if (micStream) micStream.getTracks().forEach(track => track.stop());
+    if (animationId) cancelAnimationFrame(animationId);
+    log("Stopped listening.");
     document.getElementById('startListenBtn').disabled = false;
     document.getElementById('stopListenBtn').disabled = true;
   }
@@ -163,4 +168,3 @@
 
 </body>
 </html>
-
