@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Ultrasonic Web Communication POC</title>
+<style>
+  body { font-family: sans-serif; padding: 20px; }
+  button { margin: 5px; padding: 10px; }
+  #log { white-space: pre-wrap; background: #eee; padding: 10px; height: 150px; overflow-y: scroll; }
+</style>
+</head>
+<body>
+
+<h1>Ultrasonic Web Communication Proof of Concept</h1>
+
+<textarea id="message" rows="2" cols="40" placeholder="Type bits like 1010101"></textarea><br/>
+<button id="sendBtn">Send</button>
+<button id="startListenBtn">Start Listening</button>
+<button id="stopListenBtn" disabled>Stop Listening</button>
+
+<h3>Received bits:</h3>
+<div id="received"></div>
+
+<h3>Log:</h3>
+<div id="log"></div>
+
+<script>
+(async () => {
+  const logElem = document.getElementById('log');
+  function log(msg) {
+    logElem.textContent += msg + "\n";
+    logElem.scrollTop = logElem.scrollHeight;
+  }
+
+  const AudioContext = window.AudioContext || window.webkitAudioContext;
+  const audioCtx = new AudioContext();
+
+  // Frequencies (Hz) for bits 0 and 1 (keep in audible-ish ultrasonic border)
+  const FREQ_0 = 16000;
+  const FREQ_1 = 18000;
+  const BIT_DURATION = 0.2; // seconds per bit
+
+  // Generate tone for one bit
+  function playTone(freq, duration) {
+    return new Promise(resolve => {
+      const oscillator = audioCtx.createOscillator();
+      oscillator.frequency.value = freq;
+      oscillator.type = 'sine';
+      const gainNode = audioCtx.createGain();
+      gainNode.gain.setValueAtTime(0.3, audioCtx.currentTime);
+
+      oscillator.connect(gainNode);
+      gainNode.connect(audioCtx.destination);
+
+      oscillator.start();
+      oscillator.stop(audioCtx.currentTime + duration);
+
+      oscillator.onended = resolve;
+    });
+  }
+
+  // Send bit string as ultrasonic tones
+  async function sendBits(bits) {
+    log("Sending bits: " + bits);
+    for (let bit of bits) {
+      const freq = bit === '1' ? FREQ_1 : FREQ_0;
+      await playTone(freq, BIT_DURATION);
+      // small gap between bits
+      await new Promise(r => setTimeout(r, 50));
+    }
+    log("Send complete");
+  }
+
+  document.getElementById('sendBtn').onclick = async () => {
+    let bits = document.getElementById('message').value.trim();
+    if (!bits.match(/^[01]+$/)) {
+      alert("Please enter only bits (0 and 1).");
+      return;
+    }
+    if (audioCtx.state === 'suspended') await audioCtx.resume();
+    sendBits(bits);
+  };
+
+  // --- Receiver setup ---
+  let micStream;
+  let analyser;
+  let dataArray;
+  let animationId;
+  let receivedBits = '';
+  const receivedElem = document.getElementById('received');
+
+  async function startListening() {
+    if (audioCtx.state === 'suspended') await audioCtx.resume();
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    const source = audioCtx.createMediaStreamSource(micStream);
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 2048;
+    source.connect(analyser);
+    dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+    receivedBits = '';
+    receivedElem.textContent = '';
+    log("Listening started");
+
+    let lastBitTime = 0;
+    const bitInterval = (BIT_DURATION + 0.05) * 1000; // ms
+
+    function getFrequencyBin(freq) {
+      return Math.round(freq / (audioCtx.sampleRate / analyser.fftSize));
+    }
+
+    function detectBit() {
+      analyser.getByteFrequencyData(dataArray);
+      // Frequencies to check
+      const bin0 = getFrequencyBin(FREQ_0);
+      const bin1 = getFrequencyBin(FREQ_1);
+
+      const mag0 = dataArray[bin0];
+      const mag1 = dataArray[bin1];
+
+      // Threshold to detect tone presence
+      const threshold = 100;
+
+      let detectedBit = null;
+      if (mag0 > threshold && mag0 > mag1) detectedBit = '0';
+      else if (mag1 > threshold && mag1 > mag0) detectedBit = '1';
+
+      if (detectedBit !== null) {
+        const now = performance.now();
+        if (now - lastBitTime > bitInterval - 50) { // prevent duplicates
+          receivedBits += detectedBit;
+          receivedElem.textContent = receivedBits;
+          log(`Detected bit: ${detectedBit}`);
+          lastBitTime = now;
+        }
+      }
+      animationId = requestAnimationFrame(detectBit);
+    }
+    detectBit();
+
+    document.getElementById('startListenBtn').disabled = true;
+    document.getElementById('stopListenBtn').disabled = false;
+  }
+
+  function stopListening() {
+    if (micStream) {
+      micStream.getTracks().forEach(track => track.stop());
+      micStream = null;
+    }
+    if (animationId) {
+      cancelAnimationFrame(animationId);
+      animationId = null;
+    }
+    log("Listening stopped");
+    document.getElementById('startListenBtn').disabled = false;
+    document.getElementById('stopListenBtn').disabled = true;
+  }
+
+  document.getElementById('startListenBtn').onclick = startListening;
+  document.getElementById('stopListenBtn').onclick = stopListening;
+})();
+</script>
+
+</body>
+</html>
